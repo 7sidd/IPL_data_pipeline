@@ -1,0 +1,187 @@
+from datetime import datetime, timedelta
+import io
+import os
+import re
+import zipfile
+import numpy as np
+import pandas as pd
+import requests
+import pendulum
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+# Define the Indian timezone for schedule
+local_tz = pendulum.timezone("Asia/Kolkata")
+
+# --- TASK 1: DOWNLOAD RAW ZIP AND UPLOAD TO S3 ---
+def extract_and_ingest_raw():
+    """
+    Downloads the latest zipped IPL data directly from Cricsheet 
+    and uploads the raw file straight into S3 bucket raw folder.
+    """
+    # Load AWS and file path variables from Airflow
+    env = Variable.get("ipl_pipeline_env_config", deserialize_json=True)
+    url = "https://cricsheet.org/downloads/ipl_csv.zip"
+    
+    print("Downloading live zip file from Cricsheet...")
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    
+    # Use the AWS connection configured in Airflow Admin
+    aws_hook = S3Hook(aws_conn_id="aws_default")
+    
+    print(f"Uploading raw zip file to s3://{env['BUCKET_NAME']}/{env['RAW_S3_KEY']}...")
+    aws_hook.load_bytes(
+        bytes_data=response.content,
+        key=env["RAW_S3_KEY"],
+        bucket_name=env["BUCKET_NAME"],
+        replace=True
+    )
+    print("Task 1 Complete: Raw zip file saved to S3 successfully.")
+
+
+# --- TASK 2: READ RAW DATA FROM S3, TRANSFORM & CALCULATE METRICS ---
+def transform_raw_to_parquet():
+    """
+    Reads the raw ZIP back from S3, filters the match files for target season,
+    cleans the data, calculates batting averages and strike rates, and saves it as Parquet.
+    """
+    # Load environment variables and set the season to analyze
+    env = Variable.get("ipl_pipeline_env_config", deserialize_json=True)
+    target_season = str(env["TARGET_SEASON"]).strip()
+    
+    aws_hook = S3Hook(aws_conn_id="aws_default")
+    
+    print(f"Pulling raw zip file back from s3://{env['BUCKET_NAME']}/{env['RAW_S3_KEY']}...")
+    file_obj = aws_hook.get_key(key=env["RAW_S3_KEY"], bucket_name=env["BUCKET_NAME"])
+    zip_bytes = file_obj.get()['Body'].read()
+    
+    all_match_chunks = []
+    
+    print(f"Opening zip file and scanning for season: {target_season}...")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        # Get all individual match CSV files and sort them numerically
+        match_files = sorted([f for f in z.namelist() if f.endswith('.csv') and re.match(r'^\d+\.csv$', f)])
+        
+        for file_name in match_files:
+            file_text = z.read(file_name).decode('utf-8')
+            lines = file_text.splitlines()
+            
+            # Check the first 30 lines of the file to see if it matches target season
+            is_target_season = False
+            for line in lines[:30]:
+                if "info,season" in line and target_season in line:
+                    is_target_season = True
+                    break
+            
+            # Only process the file if it belongs to target season
+            if is_target_season:
+                match_id = file_name.split('.')[0]
+                ball_rows = [line for line in lines if line.startswith('ball,')]
+                
+                if ball_rows:
+                    csv_data = "\n".join(ball_rows)
+                    df_match = pd.read_csv(io.StringIO(csv_data), header=None)
+                    
+                    # Keep the first 16 columns and rename them to match database structure
+                    df_match = df_match.iloc[:, :16]
+                    df_match.columns = [
+                        'record_type', 'innings', 'ball', 'batting_team', 'striker', 'non_striker', 'bowler',
+                        'runs_off_bat', 'extras', 'wides', 'noballs', 'byes', 'legbyes', 'penalty',
+                        'wicket_type', 'player_dismissed'
+                    ]
+                    
+                    # Track the match ID and season context for each row
+                    df_match['match_id'] = match_id
+                    df_match['season'] = target_season
+                    all_match_chunks.append(df_match)
+                    
+    if not all_match_chunks:
+        raise ValueError(f"Pipeline stopped: No matches found for season: {target_season}")
+        
+    # Combine all individual match dataframes into one master dataframe
+    df_current = pd.concat(all_match_chunks, ignore_index=True)
+    print(f"Combined data contains {len(df_current)} rows. Starting Tableau KPI calculations...")
+    
+    # --- TRANSFORM AND CALCULATE CORE PLAYER ANALYTICS KPIs ---
+    # 1. Total up the runs scored and balls faced by each player
+    batting = df_current.groupby(['season', 'batting_team', 'striker']).agg(
+        runs_scored=('runs_off_bat', 'sum'),
+        balls_faced=('ball', 'count')
+    ).reset_index()
+    
+    # 2. Total up the number of times each player was dismissed
+    dismissals = df_current[df_current['player_dismissed'].notna()].groupby(
+        ['season', 'batting_team', 'player_dismissed']
+    ).size().reset_index(name='dismissals')
+    
+    # 3. Merge batting and dismissal data together (fill missing dismissals with 0)
+    player_stats = pd.merge(
+        batting, dismissals, 
+        left_on=['season', 'batting_team', 'striker'], 
+        right_on=['season', 'batting_team', 'player_dismissed'], 
+        how='left'
+    ).fillna({'dismissals': 0})
+    
+    # 4. Calculate Batting Average and Strike Rate (handle division-by-zero if player is not out)
+    player_stats['batting_avg'] = np.where(
+        player_stats['dismissals'] == 0, 
+        player_stats['runs_scored'].astype(float), 
+        (player_stats['runs_scored'] / player_stats['dismissals']).astype(float)
+    )
+    player_stats['strike_rate'] = ((player_stats['runs_scored'] / player_stats['balls_faced']) * 100).astype(float)
+    
+    # 5. Format column names for Amazon Athena database integration
+    player_stats.rename(columns={'striker': 'player', 'batting_team': 'team'}, inplace=True)
+    if 'player_dismissed' in player_stats.columns:
+        player_stats.drop(columns=['player_dismissed'], inplace=True)
+        
+    # Save the file locally inside the container as a temporary Parquet file
+    os.makedirs(os.path.dirname(env["LOCAL_TEMP_PARQUET"]), exist_ok=True)
+    player_stats.to_parquet(env["LOCAL_TEMP_PARQUET"], index=False, compression='snappy')
+    
+    # Upload the clean, optimized Parquet file to S3 analytics folder
+    print(f"Uploading final Parquet file to s3://{env['BUCKET_NAME']}/{env['TRANSFORMED_S3_KEY']}...")
+    aws_hook.load_file(
+        filename=env["LOCAL_TEMP_PARQUET"],
+        key=env["TRANSFORMED_S3_KEY"],
+        bucket_name=env["BUCKET_NAME"],
+        replace=True  # Overwrite old data with the fresh calculations
+    )
+    print("Task 2 Complete: Transformed analytics data loaded to S3.")
+
+
+# --- DAG FRAMEWORK SYSTEM DEFINITIONS ---
+default_args = {
+    'owner': 'sidd',
+    'depends_on_past': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+start_date_ist = datetime(2026, 3, 28, tzinfo=local_tz)
+
+with DAG(
+    'ipl_live_data_pipeline',
+    default_args=default_args,
+    description='Automated pipeline moving raw S3 data to clean analytics-ready Parquet files',
+    start_date=start_date_ist,
+    schedule='0 16 */2 * *',  # Triggers at exactly 4:00 PM IST every alternate day
+    catchup=False,
+) as dag:
+
+    ingest_raw_task = PythonOperator(
+        task_id='ingest_raw_zip_to_s3',
+        python_callable=extract_and_ingest_raw,
+    )
+
+    transform_parquet_task = PythonOperator(
+        task_id='transform_and_calculate_metrics',
+        python_callable=transform_raw_to_parquet,
+    )
+
+    # Establish the sequence dependency flow
+    ingest_raw_task >> transform_parquet_task
