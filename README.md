@@ -27,3 +27,5 @@ The project is split into two clean phases—keeping the raw historical data com
 
 ```text
 └── DAG File  # The main Apache Airflow DAG script containing the ETL logic
+└── LICENSE
+└── README.md
